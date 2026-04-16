@@ -2,7 +2,7 @@ name: Generate dynamic rules
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "23 * * * *"
   workflow_dispatch:
 
 permissions:
