@@ -1,0 +1,1 @@
+# onlyfans-deob [![Generate dynamic rules](https://github.com/Vint6191/onlyfans-deob/actions/workflows/update-rules.yml/badge.svg)](https://github.com/Vint6191/onlyfans-deob/actions/workflows/update-rules.yml)
