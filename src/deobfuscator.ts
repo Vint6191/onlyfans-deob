@@ -469,8 +469,13 @@ function deobfuscate(source: string) {
   /* ------------------- 2️⃣ функции + shuffle ------------------- */
   log("BEGIN parseDecryptFunctions");
   traverse(ast, {
-    // базовая функция k
+    // -------------------------------------------------------------
+    // This single visitor handles:
+    //   ① the base decryption function (k)
+    //   ② thin‑wrapper functions (i, n, …)
+    // -------------------------------------------------------------
     FunctionDeclaration(path) {
+      // ---- ① look for the base decryption function (k) ----
       if (!baseDecryptFunc) {
         const name = findBaseDecryptFunction(
           path,
@@ -480,17 +485,19 @@ function deobfuscate(source: string) {
         if (name) {
           baseDecryptFunc = name;
           log("baseDecryptFunc:", name);
+          // No need to hunt for wrappers on this node yet – they will be
+          // processed on later passes once the base name is known.
+          return;
         }
       }
-    },
 
-    // thin‑wrapper‑функции внутри FunctionDeclaration
-    FunctionDeclaration(path) {
+      // ---- ② look for thin‑wrapper functions (i, n, …) ----
       if (!firstBinding && baseDecryptFunc) {
         const b = findDecryptFunction(path, collector, baseDecryptFunc);
         if (b) {
           firstBinding = b;
           log("firstBinding:", b.identifier.name);
+          return;
         }
       } else if (!secondBinding && firstBinding) {
         const b = findDecryptFunction(
