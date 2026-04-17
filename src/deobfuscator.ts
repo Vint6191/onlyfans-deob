@@ -7,7 +7,7 @@ import beautify from "js-beautify";
 import { readFileSync, writeFile } from "fs";
 import vm from "vm";
 
-/* -------------------------------  Binary operators  ------------------------------- */
+/* -------------------------------  Бинарные операторы  ------------------------------- */
 const binop = [
   "+", "-", "/", "%", "*", "**", "&", "|", ">>", ">>>", "<<", "^",
   "==", "===", "!=", "!==", "in", "instanceof",
@@ -16,12 +16,12 @@ const binop = [
 type BinaryOperator = typeof binop[number];
 const isBinaryOperator = (x: any): x is BinaryOperator => binop.includes(x);
 
-/* -------------------------------  Logger  ------------------------------- */
+/* -------------------------------  Утилита логов  ------------------------------- */
 function log(...args: any[]) {
   console.error("[deobf]", ...args);
 }
 
-/* -------------------------------  VM context  ------------------------------- */
+/* -------------------------------  VM‑контекст  ------------------------------- */
 function makeContext(): vm.Context {
   return vm.createContext({
     parseInt, parseFloat, isNaN, isFinite,
@@ -32,9 +32,10 @@ function makeContext(): vm.Context {
   });
 }
 
-/* -------------------------------  SetupCollector  ------------------------------- */
+/* -------------------------------  Collector  ------------------------------- */
 class SetupCollector {
   private snippets: string[] = [];
+  private errCount = 0;
   readonly ctx: vm.Context;
 
   constructor(ctx: vm.Context) {
@@ -64,7 +65,11 @@ class SetupCollector {
   run(code: string): any {
     try {
       return vm.runInContext(code, this.ctx);
-    } catch (_) {
+    } catch (e: any) {
+      if (this.errCount < 5) {
+        log("vm.run error:", e?.message, "| code:", code.slice(0, 200));
+        this.errCount++;
+      }
       return undefined;
     }
   }
@@ -77,6 +82,7 @@ function findStringsArray(
   path: NodePath<t.FunctionDeclaration>,
   collector: SetupCollector,
 ): string | undefined {
+  if (!path.node) return;
   const node = path.node;
   const body = node.body.body;
   if (node.params.length !== 0) return;
@@ -126,6 +132,7 @@ function findBaseDecryptFunction(
   collector: SetupCollector,
   funcObfStrings: string,
 ): string | undefined {
+  if (!path.node) return;
   const node = path.node;
   const body = node.body.body;
   if (node.params.length !== 2) return;
@@ -144,7 +151,7 @@ function findBaseDecryptFunction(
 
   log("findBaseDecryptFunction -> accepted:", node.id.name, "stmts:", body.length);
   collector.add(generate(node).code);
-  path.remove();   // remove it from the AST; we will execute it via the VM
+  path.remove();
   return node.id.name;
 }
 
@@ -156,11 +163,13 @@ function findDecryptFunction(
   collector: SetupCollector,
   baseDecryptFunc: string,
 ): Binding | undefined {
+  if (!path.node) return;
   const node = path.node;
   if (node.params.length !== 2) return;
   if (node.body.body.length !== 1) return;
   const ret = node.body.body[0];
   if (!t.isReturnStatement(ret) || !ret.argument) return;
+  if (!t.isCallExpression(ret.argument)) return;
   const call = ret.argument as t.CallExpression;
   if (!t.isIdentifier(call.callee, { name: baseDecryptFunc })) return;
   if (!node.id) return;
@@ -185,6 +194,7 @@ function findDecryptFunctionFromDeclarator(
   collector: SetupCollector,
   baseDecryptFunc: string,
 ): Binding | undefined {
+  if (!path.node) return;
   const node = path.node;
   if (!t.isIdentifier(node.id) || !node.init) return;
 
@@ -201,6 +211,7 @@ function findDecryptFunctionFromDeclarator(
     stmt = t.returnStatement(init.body as t.Expression);
   }
   if (!t.isReturnStatement(stmt) || !stmt.argument) return;
+  if (!t.isCallExpression(stmt.argument)) return;
   const call = stmt.argument as t.CallExpression;
   if (!t.isIdentifier(call.callee, { name: baseDecryptFunc })) return;
 
@@ -230,6 +241,7 @@ function shuffleObfuscatedStrings(
   collector: SetupCollector,
   funcObfStrings: string,
 ): boolean | undefined {
+  if (!path.node) return;
   const node = path.node;
   if (node.arguments.length !== 2) return;
   if (!t.isIdentifier(node.arguments[0], { name: funcObfStrings })) return;
@@ -261,12 +273,14 @@ function decryptMapKeys(binding: Binding, collector: SetupCollector) {
     binding.referencePaths.length,
   );
   let replaced = 0;
+  let skipped = 0;
 
   for (const ref of binding.referencePaths) {
     const callPath = ref.parentPath as NodePath<t.CallExpression>;
-    if (!callPath) continue;
+    if (!callPath || !callPath.node) { skipped++; continue; }
     // Skip the `return i(...);` that belongs to the wrapper itself.
-    if (t.isReturnStatement(callPath.parentPath?.node)) continue;
+    if (t.isReturnStatement(callPath.parentPath?.node)) { skipped++; continue; }
+    if (!t.isCallExpression(callPath.node)) { skipped++; continue; }
 
     // -------------------------------------------------------------
     // Try to evaluate every argument statically.  When we can,
@@ -291,12 +305,21 @@ function decryptMapKeys(binding: Binding, collector: SetupCollector) {
       : generate(callPath.node).code;
 
     const value = collector.run(src);
-    if (value !== undefined) {
+    // Accept strings, numbers, booleans, null (not undefined/objects/functions)
+    if (
+      value !== undefined &&
+      (typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean" ||
+        value === null)
+    ) {
       callPath.replaceWith(t.valueToNode(value));
       replaced++;
+    } else {
+      skipped++;
     }
   }
-  log("decryptMapKeys -> replaced:", replaced);
+  log("decryptMapKeys -> replaced:", replaced, "skipped:", skipped);
 }
 
 /* -------------------------------------------------------------------------
@@ -311,6 +334,7 @@ class MapReplacer {
 
   /** Analyse `var o = { … }` and keep only the entries that encode something */
   parseMap(path: NodePath<t.VariableDeclarator>): boolean {
+    if (!path.node) return false;
     const node = path.node;
     if (!t.isObjectExpression(node.init) || !t.isIdentifier(node.id)) return false;
 
@@ -337,7 +361,7 @@ class MapReplacer {
             flag = true;
           }
         }
-        // keep only the operators/helpers, discard the rest
+        // keep only the operators / helpers, discard the rest
         return false;
       }
 
@@ -374,9 +398,9 @@ class MapReplacer {
         // property may be a string literal (computed) or an identifier (dot)
         let key: string | undefined;
         if (t.isStringLiteral(property)) {
-          key = property.value;                     // o["Add"]
+          key = property.value;
         } else if (t.isIdentifier(property) && !computed) {
-          key = property.name;                      // o.Add
+          key = property.name;
         }
         if (!key) return;
 
@@ -449,6 +473,7 @@ class MapReplacer {
  *  7️⃣ unwrapOrElse → a?.b?.c || d
  * ------------------------------------------------------------------------- */
 function simplifyUnwrapOrElse(path: NodePath<t.CallExpression>) {
+  if (!path.node) return;
   const node = path.node;
   if (!t.isCallExpression(node.callee) || node.arguments.length !== 3) return;
   const [obj, prop, fallback] = node.arguments as t.Expression[];
@@ -512,6 +537,8 @@ function deobfuscate(source: string) {
   traverse(ast, {
     // One visitor handles both the base function and the thin wrappers.
     FunctionDeclaration(path) {
+      if (!path.node) return;
+
       // ----- base decryption function -----
       if (!baseDecryptFunc) {
         const name = findBaseDecryptFunction(
@@ -522,10 +549,7 @@ function deobfuscate(source: string) {
         if (name) {
           baseDecryptFunc = name;
           log("baseDecryptFunc:", name);
-          // The node was removed inside `findBaseDecryptFunction`,
-          // so we must stop processing this path – otherwise `path.node`
-          // becomes null.
-          return;
+          return; // path удалён, выходим
         }
       }
 
@@ -542,12 +566,15 @@ function deobfuscate(source: string) {
         if (b) {
           secondBinding = b;
           log("secondBinding:", b.identifier.name);
+          return;
         }
       }
     },
 
     // ----- thin wrappers declared via variable (var r = function…) -----
     VariableDeclarator(path) {
+      if (!path.node) return;
+
       if (!firstBinding && baseDecryptFunc) {
         const b = findDecryptFunctionFromDeclarator(path, collector, baseDecryptFunc);
         if (b) {
@@ -560,12 +587,14 @@ function deobfuscate(source: string) {
         if (b) {
           secondBinding = b;
           log("secondBinding (var):", b.identifier.name);
+          return;
         }
       }
     },
 
     // ----- shuffle – a single call like f(519367) -----
     CallExpression(path) {
+      if (!path.node) return;
       if (!funcObfStrings || foundShuffle) return;
       if (shuffleObfuscatedStrings(path, collector, funcObfStrings)) {
         foundShuffle = true;
@@ -604,6 +633,7 @@ function deobfuscate(source: string) {
   const mr = new MapReplacer();
   traverse(ast, {
     VariableDeclarator(path) {
+      if (!path.node) return;
       if (!mr.parseMap(path)) return;
       mr.replaceBinaryOpCalls();
       mr.replaceMapIndexing();
@@ -625,9 +655,9 @@ function deobfuscate(source: string) {
   const validId = /^(?!(?:do|if|in|for|let|new|try|var|case|else|enum|eval|false|null|this|true|void|with|break|catch|class|const|super|throw|while|yield|delete|export|import|public|return|static|switch|typeof|default|extends|finally|package|private|continue|debugger|function|arguments|interface|protected|implements|instanceof)$)[$_A-Za-z][$_0-9A-Za-z]*$/;
   traverse(ast, {
     MemberExpression(path) {
+      if (!path.node) return;
       const { object, property, computed } = path.node;
-      if (!computed || !t.isStringLiteral(property) || !validId.test(property.value))
-        return;
+      if (!computed || !t.isStringLiteral(property) || !validId.test(property.value)) return;
       path.replaceWith(
         t.memberExpression(object, t.identifier(property.value), false),
       );
