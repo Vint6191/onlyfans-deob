@@ -5,23 +5,6 @@ import generate from "@babel/generator";
 import { readFileSync } from "fs";
 import vm from "vm";
 
-/**
- * Extracts OnlyFans dynamic-rules from the (partially) deobfuscated script.
- *
- * Strategy is intentionally hybrid:
- *   - prefix / suffix / static_param are pulled out by AST pattern-matching
- *     on `.join(":")` and `.join("\n")` calls. These are stable: OF has not
- *     changed the overall shape of `[static, time, url, uid].join("\n")` or
- *     `[prefix, hash, checksum, suffix].join(":")` in a long time.
- *
- *   - checksum_indexes and checksum_constant are extracted by actually
- *     RUNNING the checksum function inside a sandbox. We feed it a
- *     known 40-char "hash", log which indexes it touched (via a hooked
- *     charCodeAt), and back-solve the constant by comparing the hex value
- *     it returned with the sum of the known charCodes. This works
- *     regardless of how deeply obfuscated the function still is.
- */
-
 interface DynamicRules {
     end: string;
     start: string;
@@ -35,22 +18,18 @@ interface DynamicRules {
     checksum_constant: number;
 }
 
-// 40-char deterministic hash stand-in. Must be length 40 (SHA-1 hex length).
-// Use varied chars so every index yields a distinguishable charCode.
-const FAKE_HASH = "0123456789abcdef" + "ghijklmnopqrstuv" + "wxyzABCDEFGH"; // 40 chars
-if (FAKE_HASH.length !== 40) throw new Error("FAKE_HASH must be 40 chars");
+// Exactly 40 chars (length of SHA-1 hex output)
+const FAKE_HASH = "0123456789abcdefghijklmnopqrstuvwxyzABCD";
+if (FAKE_HASH.length !== 40) {
+    throw new Error("FAKE_HASH must be 40 chars (got " + FAKE_HASH.length + ")");
+}
 
-/**
- * Find the checksum FunctionExpression/ArrowFunctionExpression inside the
- * `.join(":")` array. Returns its source code as a string that can be
- * evaluated standalone (after we supply needed externals in the VM).
- */
 function findChecksumFunctionSource(ast: t.Node): string | undefined {
     let source: string | undefined;
 
     traverse(ast, {
         CallExpression(path) {
-            if (source) return; // first match only
+            if (source) return;
             const node = path.node;
             if (!t.isMemberExpression(node.callee)) return;
             if (!t.isIdentifier(node.callee.property, { name: "join" })) return;
@@ -59,8 +38,6 @@ function findChecksumFunctionSource(ast: t.Node): string | undefined {
             if ((node.arguments[0] as t.StringLiteral).value !== ":") return;
             if (!t.isArrayExpression(node.callee.object)) return;
 
-            // Find an immediately-invoked function in the array elements.
-            // Pattern: function(W){...}(hashVar)  or  (W => {...})(hashVar)
             for (const elem of node.callee.object.elements) {
                 if (!elem || !t.isCallExpression(elem)) continue;
                 const callee = elem.callee;
@@ -75,37 +52,20 @@ function findChecksumFunctionSource(ast: t.Node): string | undefined {
     return source;
 }
 
-/**
- * Find ALL auxiliary top-level function/variable declarations that the
- * checksum function might reference (operator maps, decrypt wrappers, etc.).
- * We include them in the sandbox so the checksum function can actually run.
- *
- * This is done permissively: we grab every top-level FunctionDeclaration
- * and VariableDeclaration and stick them into the VM context. Harmless
- * ones just sit there unused.
- */
 function extractAuxSource(ast: t.Node): string {
     if (!t.isFile(ast) && !t.isProgram(ast)) return "";
     const program = t.isFile(ast) ? ast.program : ast;
     const out: string[] = [];
 
-    // Traverse top-level program statements AND go one level into the
-    // webpack module function, which is where OF stores everything.
     for (const stmt of program.body) {
-        // Pull top-level function + var decls directly
         if (t.isFunctionDeclaration(stmt) || t.isVariableDeclaration(stmt)) {
             out.push(generate(stmt).code);
         }
     }
 
-    // The real body of OF code lives inside a webpack module:
-    //   (self.webpackChunkof_vue = ...).push([[2313], {802313: function(W,n,o){ ... HERE ... }}])
-    // We dig into that inner function's body to get the helper vars & funcs.
     traverse(ast, {
         FunctionExpression(path) {
-            // Heuristic: OF module fn has exactly 3 params (W, n, o)
             if (path.node.params.length !== 3) return;
-            // Only take ones whose body contains `join` somewhere (that's the signing module)
             let hasJoin = false;
             path.traverse({
                 Identifier(p) {
@@ -114,7 +74,6 @@ function extractAuxSource(ast: t.Node): string {
             });
             if (!hasJoin) return;
 
-            // Pull inner var/func decls into aux
             for (const inner of path.node.body.body) {
                 if (t.isVariableDeclaration(inner) || t.isFunctionDeclaration(inner)) {
                     out.push(generate(inner).code);
@@ -138,7 +97,6 @@ function runChecksumFunction(
 ): RuntimeResult | undefined {
     const touchedIndexes: number[] = [];
 
-    // Build sandbox with hooked charCodeAt
     const sandbox: any = {
         Math, Date, JSON, console,
         Array, Number, Boolean, Object, RegExp,
@@ -158,7 +116,6 @@ function runChecksumFunction(
 
     const ctx = vm.createContext(sandbox);
 
-    // Install hooked String.prototype.charCodeAt that logs reads on FAKE_HASH
     const installHook = `
         (function() {
             const origCharCodeAt = String.prototype.charCodeAt;
@@ -181,17 +138,12 @@ function runChecksumFunction(
         return;
     }
 
-    // Load all helper code (operator maps, decrypt wrappers, etc.)
-    // Wrap in try so partial failures don't kill everything.
     try {
         vm.runInContext(auxSource, ctx);
     } catch (e: any) {
-        // Aux load is best-effort; many parts may fail and that's okay
-        // as long as the operator map + decrypt wrappers get through.
-        console.error("[runtime] aux load (partial) warning:", e?.message?.slice(0, 120));
+        console.error("[runtime] aux load (partial) warning:", e?.message?.slice(0, 200));
     }
 
-    // Now call the checksum function with FAKE_HASH
     let result: any;
     try {
         const invoker = `(${funcSource})(${JSON.stringify(FAKE_HASH)})`;
@@ -206,11 +158,6 @@ function runChecksumFunction(
         return;
     }
 
-    // Back-solve constant:
-    //   result (hex) = Math.floor(SUM(W[idx_i].charCodeAt(0) + const_i))
-    //   We know: all charCodes (from FAKE_HASH + touchedIndexes)
-    //   We know: result as a number
-    //   constant = result - sum_of_charcodes
     const decimal = typeof result === "number"
         ? result
         : parseInt(String(result), 16);
@@ -225,7 +172,6 @@ function runChecksumFunction(
     );
     const checksum_constant = decimal - sumOfCharCodes;
 
-    // Normalize indexes to be in [0, 40)
     const checksum_indexes = touchedIndexes.map(i => ((i % 40) + 40) % 40);
 
     return { checksum_indexes, checksum_constant };
@@ -236,7 +182,6 @@ function getRules(ast: t.Node, appToken: string): DynamicRules | undefined {
     let prefix: string | undefined;
     let suffix: string | undefined;
 
-    // Stage 1: pull prefix / suffix / static_param via AST patterns
     traverse(ast, {
         CallExpression(path) {
             const node = path.node;
@@ -289,7 +234,6 @@ function getRules(ast: t.Node, appToken: string): DynamicRules | undefined {
 
     console.error("[dynamic_rules] Stage 1 OK: prefix=" + prefix + " suffix=" + suffix);
 
-    // Stage 2: run the checksum function to back-solve indexes + constant
     const funcSource = findChecksumFunctionSource(ast);
     if (!funcSource) {
         console.error("[dynamic_rules] Stage 2: checksum function not found");
@@ -303,7 +247,6 @@ function getRules(ast: t.Node, appToken: string): DynamicRules | undefined {
     const rt = runChecksumFunction(funcSource, auxSource);
     if (!rt) {
         console.error("[dynamic_rules] Stage 2 failed: could not execute checksum");
-        // Return partial rules — still useful even without checksum
         return {
             end: suffix,
             start: prefix,
