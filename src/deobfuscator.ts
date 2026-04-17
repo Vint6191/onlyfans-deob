@@ -7,7 +7,7 @@ import beautify from "js-beautify";
 import { readFileSync, writeFile } from "fs";
 import vm from "vm";
 
-/* -------------------------------  Бинарные операторы  ------------------------------- */
+/* -------------------------------  Binary operators  ------------------------------- */
 const binop = [
   "+", "-", "/", "%", "*", "**", "&", "|", ">>", ">>>", "<<", "^",
   "==", "===", "!=", "!==", "in", "instanceof",
@@ -16,12 +16,12 @@ const binop = [
 type BinaryOperator = typeof binop[number];
 const isBinaryOperator = (x: any): x is BinaryOperator => binop.includes(x);
 
-/* -------------------------------  Утилита логов  ------------------------------- */
+/* -------------------------------  Logger  ------------------------------- */
 function log(...args: any[]) {
   console.error("[deobf]", ...args);
 }
 
-/* -------------------------------  VM‑контекст  ------------------------------- */
+/* -------------------------------  VM context  ------------------------------- */
 function makeContext(): vm.Context {
   return vm.createContext({
     parseInt, parseFloat, isNaN, isFinite,
@@ -32,7 +32,7 @@ function makeContext(): vm.Context {
   });
 }
 
-/* -------------------------------  Collector  ------------------------------- */
+/* -------------------------------  SetupCollector  ------------------------------- */
 class SetupCollector {
   private snippets: string[] = [];
   readonly ctx: vm.Context;
@@ -144,7 +144,7 @@ function findBaseDecryptFunction(
 
   log("findBaseDecryptFunction -> accepted:", node.id.name, "stmts:", body.length);
   collector.add(generate(node).code);
-  path.remove();
+  path.remove();   // remove it from the AST; we will execute it via the VM
   return node.id.name;
 }
 
@@ -337,7 +337,7 @@ class MapReplacer {
             flag = true;
           }
         }
-        // keep only the operators / helpers, discard the rest
+        // keep only the operators/helpers, discard the rest
         return false;
       }
 
@@ -374,9 +374,9 @@ class MapReplacer {
         // property may be a string literal (computed) or an identifier (dot)
         let key: string | undefined;
         if (t.isStringLiteral(property)) {
-          key = property.value;
+          key = property.value;                     // o["Add"]
         } else if (t.isIdentifier(property) && !computed) {
-          key = property.name;
+          key = property.name;                      // o.Add
         }
         if (!key) return;
 
@@ -522,8 +522,10 @@ function deobfuscate(source: string) {
         if (name) {
           baseDecryptFunc = name;
           log("baseDecryptFunc:", name);
-          // continue – the same node might also be a thin wrapper (unlikely),
-          // but we will catch wrappers in a later pass.
+          // The node was removed inside `findBaseDecryptFunction`,
+          // so we must stop processing this path – otherwise `path.node`
+          // becomes null.
+          return;
         }
       }
 
@@ -624,7 +626,8 @@ function deobfuscate(source: string) {
   traverse(ast, {
     MemberExpression(path) {
       const { object, property, computed } = path.node;
-      if (!computed || !t.isStringLiteral(property) || !validId.test(property.value)) return;
+      if (!computed || !t.isStringLiteral(property) || !validId.test(property.value))
+        return;
       path.replaceWith(
         t.memberExpression(object, t.identifier(property.value), false),
       );
