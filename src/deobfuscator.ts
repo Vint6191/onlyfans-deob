@@ -42,12 +42,10 @@ class SetupCollector {
     this.ctx = ctx;
   }
 
-  /** Add a piece of code – will be executed later */
   add(code: string) {
     this.snippets.push(code);
   }
 
-  /** Execute everything that has been collected and clear the buffer */
   flush() {
     if (!this.snippets.length) return;
     const combined = this.snippets.join(";\n");
@@ -61,7 +59,6 @@ class SetupCollector {
     }
   }
 
-  /** Execute a single piece of code and return its result (or undefined) */
   run(code: string): any {
     try {
       return vm.runInContext(code, this.ctx);
@@ -88,7 +85,6 @@ function findStringsArray(
   if (node.params.length !== 0) return;
   if (body.length !== 2) return;
 
-  // Look for `var <id> = [ "…", … ];`
   const varDecl = body.find(
     (stmt): stmt is t.VariableDeclaration => t.isVariableDeclaration(stmt)
   );
@@ -100,12 +96,6 @@ function findStringsArray(
 
   const arraySize = (decl.init as t.ArrayExpression).elements.length;
 
-  // -----------------------------------------------------------------
-  // The obfuscator often re‑uses the identifier `i` for a thin wrapper.
-  // If we keep that name the wrapper will overwrite the array‑function
-  // in the VM, breaking all later calls.  We therefore rename it to a
-  // guaranteed‑unique identifier.
-  // -----------------------------------------------------------------
   const oldName = node.id.name;
   const newName = "__obfStrArray";
   path.scope.rename(oldName, newName);
@@ -119,8 +109,8 @@ function findStringsArray(
     arraySize,
   );
 
-  collector.add(generate(node).code);   // add the renamed function to the VM
-  path.remove();                      // remove it from the final AST
+  collector.add(generate(node).code);
+  path.remove();
   return newName;
 }
 
@@ -138,7 +128,6 @@ function findBaseDecryptFunction(
   if (node.params.length !== 2) return;
   if (!node.id) return;
 
-  // The base function calls the string‑array function at least once.
   const usesObfStrings = body.some((stmt) => {
     return t.isVariableDeclaration(stmt) && stmt.declarations.some((d) => {
       return (
@@ -174,7 +163,7 @@ function findDecryptFunction(
   if (!t.isIdentifier(call.callee, { name: baseDecryptFunc })) return;
   if (!node.id) return;
 
-  log("findDecryptFunction -> accepted:", node.id.name);
+  log("findDecryptFunction -> accepted:", node.id.name, "calls:", baseDecryptFunc);
   collector.add(generate(node).code);
   const binding = path.scope.getBinding(node.id.name);
   if (!binding) {
@@ -202,7 +191,6 @@ function findDecryptFunctionFromDeclarator(
   if (!t.isFunctionExpression(init) && !t.isArrowFunctionExpression(init)) return;
   if (init.params.length !== 2) return;
 
-  // Normalise the body to a single ReturnStatement
   let stmt: t.Statement | undefined;
   if (t.isBlockStatement(init.body)) {
     if (init.body.body.length !== 1) return;
@@ -216,9 +204,8 @@ function findDecryptFunctionFromDeclarator(
   if (!t.isIdentifier(call.callee, { name: baseDecryptFunc })) return;
 
   const funcName = node.id.name;
-  log("findDecryptFunctionFromDeclarator -> accepted:", funcName);
+  log("findDecryptFunctionFromDeclarator -> accepted:", funcName, "calls:", baseDecryptFunc);
 
-  // Store the wrapper in the VM (e.g. `r = function(a,b){…}`)
   collector.add(`${funcName} = ${generate(init).code}`);
 
   const binding = path.scope.getBinding(funcName);
@@ -227,7 +214,6 @@ function findDecryptFunctionFromDeclarator(
     return;
   }
 
-  // Remove the declarator from the AST – we already added it to the VM.
   path.remove();
   log("  refs:", binding.referencePaths.length);
   return binding;
@@ -253,7 +239,6 @@ function shuffleObfuscatedStrings(
   collector.add(generate(t.expressionStatement(node)).code);
   collector.flush();
 
-  // Remove the call from the AST – it has already been executed.
   if (t.isUnaryExpression(path.parentPath.node)) {
     path.parentPath.remove();
   } else {
@@ -278,16 +263,9 @@ function decryptMapKeys(binding: Binding, collector: SetupCollector) {
   for (const ref of binding.referencePaths) {
     const callPath = ref.parentPath as NodePath<t.CallExpression>;
     if (!callPath || !callPath.node) { skipped++; continue; }
-    // Skip the `return i(...);` that belongs to the wrapper itself.
     if (t.isReturnStatement(callPath.parentPath?.node)) { skipped++; continue; }
     if (!t.isCallExpression(callPath.node)) { skipped++; continue; }
 
-    // -------------------------------------------------------------
-    // Try to evaluate every argument statically.  When we can,
-    // we pass the literal JSON value to the VM; otherwise we fall
-    // back to executing the raw code (the VM already has all needed
-    // helpers in its context).
-    // -------------------------------------------------------------
     const argCodes: string[] = [];
     let allConfident = true;
     callPath.get("arguments").forEach((arg) => {
@@ -305,7 +283,6 @@ function decryptMapKeys(binding: Binding, collector: SetupCollector) {
       : generate(callPath.node).code;
 
     const value = collector.run(src);
-    // Accept strings, numbers, booleans, null (not undefined/objects/functions)
     if (
       value !== undefined &&
       (typeof value === "string" ||
@@ -332,7 +309,6 @@ class MapReplacer {
   mapName: string | undefined;
   scope: Scope | undefined;
 
-  /** Analyse `var o = { … }` and keep only the entries that encode something */
   parseMap(path: NodePath<t.VariableDeclarator>): boolean {
     if (!path.node) return false;
     const node = path.node;
@@ -343,7 +319,6 @@ class MapReplacer {
       if (!t.isObjectProperty(el) || !t.isIdentifier(el.key)) return true;
       const key = el.key.name;
 
-      // value is a function → it encodes an operator or a small helper
       if (t.isFunctionExpression(el.value)) {
         const body = el.value.body.body;
         if (body.length !== 1 || !t.isReturnStatement(body[0])) return true;
@@ -361,18 +336,16 @@ class MapReplacer {
             flag = true;
           }
         }
-        // keep only the operators / helpers, discard the rest
         return false;
       }
 
-      // plain string literal → simple substitution
       if (t.isStringLiteral(el.value)) {
         this.decryptionMap[key] = el.value.value;
         flag = true;
         return false;
       }
 
-      return true; // keep anything we don't understand
+      return true;
     });
 
     if (flag) {
@@ -383,7 +356,6 @@ class MapReplacer {
     return flag;
   }
 
-  /** Replace calls like `o["Add"](a,b)` **or** `o.Add(a,b)` with `a + b` */
   replaceBinaryOpCalls() {
     let n = 0;
     this.scope?.traverse(this.scope.path.node, {
@@ -392,10 +364,8 @@ class MapReplacer {
         if (!t.isMemberExpression(node.callee)) return;
         const { object, property, computed } = node.callee;
 
-        // object must be the operator‑map identifier (e.g. `o`)
         if (!t.isIdentifier(object, { name: this.mapName })) return;
 
-        // property may be a string literal (computed) or an identifier (dot)
         let key: string | undefined;
         if (t.isStringLiteral(property)) {
           key = property.value;
@@ -421,8 +391,6 @@ class MapReplacer {
     log("replaceBinaryOpCalls ->", n);
   }
 
-  /** Replace plain map look‑ups (`o["X"]` or `o.X`) with the literal value,
-   *  and replace calls like `o["X"](a,b)` with the appropriate call‑through. */
   replaceMapIndexing() {
     if (!this.mapName) return;
     this.scope?.crawl();
@@ -432,32 +400,29 @@ class MapReplacer {
     let n = 0;
 
     for (const ref of refs) {
-      const mem = ref.parentPath;                 // MemberExpression ?
-      const memParent = mem?.parentPath;          // maybe CallExpression
+      const mem = ref.parentPath;
+      const memParent = mem?.parentPath;
       if (!mem || !memParent || !t.isMemberExpression(mem.node)) continue;
 
       const { object, computed, property } = mem.node;
       if (object !== ref.node) continue;
 
-      // Resolve the key (computed string literal or plain identifier)
       let key: string | undefined;
       if (computed && t.isStringLiteral(property)) {
-        key = property.value;                     // o["foo"]
+        key = property.value;
       } else if (!computed && t.isIdentifier(property)) {
-        key = property.name;                      // o.foo
+        key = property.name;
       }
       if (!key) continue;
 
       const val = this.decryptionMap[key];
 
-      // 1️⃣ simple value substitution (string literal)
       if (typeof val === "string" && !isBinaryOperator(val)) {
         mem.replaceWith(t.valueToNode(val));
         n++;
         continue;
       }
 
-      // 2️⃣ call‑through: map["X"](a,b,…) → a(b,…)
       if (typeof val !== "string" && t.isCallExpression(memParent.node) &&
           memParent.node.arguments.length !== 0) {
         memParent.node.callee = memParent.node.arguments[0] as t.Expression;
@@ -480,10 +445,8 @@ function simplifyUnwrapOrElse(path: NodePath<t.CallExpression>) {
   let res: t.Expression | undefined;
 
   if (!t.isStringLiteral(prop) || !prop.value.includes(".")) {
-    // one‑level optional chaining
     res = t.memberExpression(obj, prop, true);
   } else {
-    // multi‑level: split by dot and chain `?.`
     for (const p of prop.value.split(".")) {
       res = res
         ? t.memberExpression(res, t.stringLiteral(p), true)
@@ -523,10 +486,7 @@ function deobfuscate(source: string) {
       }
     },
   });
-  log(
-    "END findObfuscatedStrings ->",
-    funcObfStrings ?? "NOT FOUND",
-  );
+  log("END findObfuscatedStrings ->", funcObfStrings ?? "NOT FOUND");
   if (!funcObfStrings) {
     console.error("String array not found!");
     return;
@@ -535,64 +495,69 @@ function deobfuscate(source: string) {
   /* ------------------- 2️⃣ Find decryption functions + shuffle ------------------- */
   log("BEGIN parseDecryptFunctions");
   traverse(ast, {
-    // One visitor handles both the base function and the thin wrappers.
     FunctionDeclaration(path) {
       if (!path.node) return;
 
       // ----- base decryption function -----
       if (!baseDecryptFunc) {
-        const name = findBaseDecryptFunction(
-          path,
-          collector,
-          funcObfStrings!,
-        );
+        const name = findBaseDecryptFunction(path, collector, funcObfStrings!);
         if (name) {
           baseDecryptFunc = name;
           log("baseDecryptFunc:", name);
-          return; // path удалён, выходим
+          return;
         }
       }
 
       // ----- thin wrappers (FunctionDeclaration) -----
-      if (!firstBinding && baseDecryptFunc) {
-        const b = findDecryptFunction(path, collector, baseDecryptFunc);
-        if (b) {
-          firstBinding = b;
-          log("firstBinding:", b.identifier.name);
-          return;
-        }
-      } else if (!secondBinding && firstBinding) {
-        const b = findDecryptFunction(path, collector, firstBinding.identifier.name);
-        if (b) {
-          secondBinding = b;
-          log("secondBinding:", b.identifier.name);
-          return;
+      // ВАЖНО: второй wrapper может оборачивать как base, так и first
+      if (baseDecryptFunc) {
+        if (!firstBinding) {
+          const b = findDecryptFunction(path, collector, baseDecryptFunc);
+          if (b) {
+            firstBinding = b;
+            log("firstBinding:", b.identifier.name);
+            return;
+          }
+        } else if (!secondBinding) {
+          // пробуем и base, и first
+          let b = findDecryptFunction(path, collector, baseDecryptFunc);
+          if (!b) {
+            b = findDecryptFunction(path, collector, firstBinding.identifier.name);
+          }
+          if (b) {
+            secondBinding = b;
+            log("secondBinding:", b.identifier.name);
+            return;
+          }
         }
       }
     },
 
-    // ----- thin wrappers declared via variable (var r = function…) -----
     VariableDeclarator(path) {
       if (!path.node) return;
 
-      if (!firstBinding && baseDecryptFunc) {
-        const b = findDecryptFunctionFromDeclarator(path, collector, baseDecryptFunc);
-        if (b) {
-          firstBinding = b;
-          log("firstBinding (var):", b.identifier.name);
-          return;
-        }
-      } else if (!secondBinding && firstBinding) {
-        const b = findDecryptFunctionFromDeclarator(path, collector, firstBinding.identifier.name);
-        if (b) {
-          secondBinding = b;
-          log("secondBinding (var):", b.identifier.name);
-          return;
+      if (baseDecryptFunc) {
+        if (!firstBinding) {
+          const b = findDecryptFunctionFromDeclarator(path, collector, baseDecryptFunc);
+          if (b) {
+            firstBinding = b;
+            log("firstBinding (var):", b.identifier.name);
+            return;
+          }
+        } else if (!secondBinding) {
+          let b = findDecryptFunctionFromDeclarator(path, collector, baseDecryptFunc);
+          if (!b) {
+            b = findDecryptFunctionFromDeclarator(path, collector, firstBinding.identifier.name);
+          }
+          if (b) {
+            secondBinding = b;
+            log("secondBinding (var):", b.identifier.name);
+            return;
+          }
         }
       }
     },
 
-    // ----- shuffle – a single call like f(519367) -----
     CallExpression(path) {
       if (!path.node) return;
       if (!funcObfStrings || foundShuffle) return;
@@ -603,14 +568,8 @@ function deobfuscate(source: string) {
   });
   log("END parseDecryptFunctions");
   log("  baseDecryptFunc:", baseDecryptFunc ?? "NOT FOUND");
-  log(
-    "  firstBinding:",
-    firstBinding?.identifier.name ?? "NOT FOUND",
-  );
-  log(
-    "  secondBinding:",
-    secondBinding?.identifier.name ?? "NOT FOUND",
-  );
+  log("  firstBinding:", firstBinding?.identifier.name ?? "NOT FOUND");
+  log("  secondBinding:", secondBinding?.identifier.name ?? "NOT FOUND");
   log("  foundShuffle:", foundShuffle);
 
   if (!baseDecryptFunc || !firstBinding || !foundShuffle) {
@@ -618,7 +577,6 @@ function deobfuscate(source: string) {
     return;
   }
 
-  // Execute everything that was collected (functions + shuffle + consts)
   collector.flush();
 
   /* ------------------- 3️⃣ Decrypt literal strings ------------------- */
