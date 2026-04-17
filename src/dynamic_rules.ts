@@ -1,108 +1,138 @@
-name: Generate dynamic rules
+import * as parser from "@babel/parser";
+import traverse from "@babel/traverse";
+import * as t from "@babel/types";
+import { readFileSync } from "fs";
 
-on:
-  schedule:
-    - cron: "23 * * * *"
-  workflow_dispatch:
+interface DynamicRules {
+    end: string;
+    start: string;
+    format: string;
+    prefix: string;
+    suffix: string;
+    static_param: string;
+    remove_headers: string[];
+    checksum_indexes: number[];
+    checksum_constant: number;
+}
 
-permissions:
-  contents: write
+function extractChecksumFromNode(
+    funcNode: t.FunctionExpression | t.ArrowFunctionExpression,
+    checksumIndexes: number[],
+    checksumConstantRef: { value: number }
+) {
+    traverse(
+        t.file(t.program([t.expressionStatement(funcNode)])),
+        {
+            BinaryExpression(path) {
+                const node = path.node;
 
-jobs:
-  update-rules:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+                if (node.operator === "%" && t.isNumericLiteral(node.left)) {
+                    checksumIndexes.push((node.left as t.NumericLiteral).value % 40);
+                }
 
-      - name: Cache curl-impersonate
-        id: cache-curl-impersonate
-        uses: actions/cache@v4
-        with:
-          path: ./curl-impersonate
-          key: ${{ runner.os }}-curl-impersonate-v0.6.1
+                if (t.isNumericLiteral(node.right)) {
+                    const val = (node.right as t.NumericLiteral).value;
+                    if (node.operator === "+") checksumConstantRef.value += val;
+                    else if (node.operator === "-") checksumConstantRef.value -= val;
+                }
+            },
+        }
+    );
+}
 
-      - name: Download curl-impersonate
-        if: steps.cache-curl-impersonate.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p curl-impersonate
-          wget -q https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz
-          tar -xf curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz -C ./curl-impersonate
+function getRules(ast: t.Node): DynamicRules | undefined {
+    let staticParam: string | undefined;
+    let prefix: string | undefined;
+    let suffix: string | undefined;
+    const checksumIndexes: number[] = [];
+    const checksumConstantRef = { value: 0 };
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
+    traverse(ast, {
+        CallExpression(path) {
+            const node = path.node;
 
-      - name: Install dependencies
-        run: npm ci
+            if (!t.isMemberExpression(node.callee)) return;
+            const { object, property } = node.callee;
+            if (!t.isIdentifier(property, { name: "join" })) return;
+            if (node.arguments.length !== 1) return;
+            if (!t.isStringLiteral(node.arguments[0])) return;
 
-      - name: Build TypeScript
-        run: npm run build
+            const joinChar = (node.arguments[0] as t.StringLiteral).value;
 
-      - name: Download obfuscated script
-        run: |
-          set -e
-          SCRIPTS_DIR="./scripts"
-          mkdir -p "$SCRIPTS_DIR/obfuscated"
+            if (joinChar === "\n" && t.isArrayExpression(object)) {
+                const first = object.elements[0];
+                if (t.isStringLiteral(first) && first.value.length === 32) {
+                    staticParam = first.value;
+                }
+                return;
+            }
 
-          WEBPAGE=$(./curl-impersonate/curl_chrome116 --silent --show-error "https://onlyfans.com")
+            if (joinChar === ":" && t.isArrayExpression(object)) {
+                const elems = object.elements;
+                if (elems.length < 4) return;
 
-          JS_URL=$(echo "$WEBPAGE" | grep -oP 'https:\/\/static2\.onlyfans\.com\/static\/prod\/[a-f0-9]\/202[567]\d{8}-[a-f0-9]{10}\/[a-f0-9]{4}\.js' | head -1)
-          if [ -z "$JS_URL" ]; then
-            echo "Could not find JS URL on onlyfans.com"
-            exit 1
-          fi
-          echo "Found JS URL: $JS_URL"
+                const firstElem = elems[0];
+                const lastElem  = elems[elems.length - 1];
 
-          SCRIPT_ID=$(echo "$JS_URL" | grep -oP '202[567]\d{8}-[a-f0-9]{10}')
-          echo "SCRIPT_ID=$SCRIPT_ID" >> $GITHUB_ENV
+                if (t.isStringLiteral(firstElem) && !isNaN(Number(firstElem.value))) {
+                    prefix = firstElem.value;
+                } else if (t.isNumericLiteral(firstElem)) {
+                    prefix = String((firstElem as t.NumericLiteral).value);
+                }
 
-          ./curl-impersonate/curl-impersonate-chrome --silent --show-error \
-            -H "User-Agent: Mozilla/5.0" \
-            -o "$SCRIPTS_DIR/obfuscated/$SCRIPT_ID.js" \
-            "$JS_URL"
+                if (
+                    t.isStringLiteral(lastElem) &&
+                    /^[0-9a-f]+$/i.test(lastElem.value) &&
+                    lastElem.value.length > 0
+                ) {
+                    suffix = lastElem.value;
+                }
 
-          APP_JS_URL="${JS_URL%/*}/app.js"
-          APP_JS=$(./curl-impersonate/curl_chrome116 --silent --show-error "$APP_JS_URL")
-          APP_TOKEN=$(echo "$APP_JS" | grep -oP ',\s*[A-Za-z_$]{1,3}\s*=\s*"\K[a-f0-9]{32}(?=")' | head -1)
-          if [ -z "$APP_TOKEN" ]; then
-            echo "Failed to extract app token"
-            exit 1
-          fi
-          echo "APP_TOKEN=$APP_TOKEN" >> $GITHUB_ENV
+                for (const elem of elems) {
+                    if (!elem || !t.isCallExpression(elem)) continue;
+                    const callee = elem.callee;
+                    if (
+                        t.isFunctionExpression(callee) ||
+                        t.isArrowFunctionExpression(callee)
+                    ) {
+                        extractChecksumFromNode(
+                            callee as t.FunctionExpression | t.ArrowFunctionExpression,
+                            checksumIndexes,
+                            checksumConstantRef
+                        );
+                        break;
+                    }
+                }
+            }
+        },
+    });
 
-      - name: Deobfuscate
-        run: |
-          set -e
-          mkdir -p ./scripts/deobfuscated
-          npm run deobfuscate -- ./scripts/obfuscated/$SCRIPT_ID.js ./scripts/deobfuscated/$SCRIPT_ID.js
+    if (!prefix || !suffix || !staticParam) {
+        console.error(
+            "[dynamic_rules] Targeted search failed.\n" +
+            "  prefix      = " + prefix + "\n" +
+            "  suffix      = " + suffix + "\n" +
+            "  static_param= " + staticParam + "\n" +
+            "The OF script structure may have changed - please update dynamic_rules.ts."
+        );
+        return undefined;
+    }
 
-      - name: Upload scripts (debug)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-scripts-${{ github.run_number }}
-          path: ./scripts/
-          retention-days: 7
+    return {
+        end:    suffix,
+        start:  prefix,
+        format: prefix + ":{}:{:x}:" + suffix,
+        prefix,
+        suffix,
+        static_param: staticParam,
+        remove_headers:    ["user_id"],
+        checksum_indexes:  checksumIndexes,
+        checksum_constant: checksumConstantRef.value,
+    };
+}
 
-      - name: Generate dynamic rules
-        run: |
-          set -e
-          rules=$(npm run --silent dynamic-rules -- ./scripts/deobfuscated/$SCRIPT_ID.js $APP_TOKEN)
-          echo "$rules" > ./dynamic-rules.json
-          echo "Generated rules:"
-          cat ./dynamic-rules.json
+const ast   = parser.parse(readFileSync(process.argv[2], "utf8"));
+const rules = getRules(ast);
+if (!rules) process.exit(1);
 
-      - name: Commit if changed
-        run: |
-          git config --local user.name  "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add ./dynamic-rules.json
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "update dynamic-rules.json ($SCRIPT_ID)"
-            git push
-          fi
+console.log(JSON.stringify(rules));
