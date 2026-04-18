@@ -82,35 +82,39 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
     const sandbox: any = {};
     const ctx = vm.createContext(sandbox);
 
-    // KEY IDEA: Use a custom String SUBCLASS for the fake hash, and only hook
-    // charCodeAt on instances of that subclass. This is 100% reliable —
-    // no valueOf() comparisons, no race conditions with Sentry or whatever.
+    // STRATEGY: wrap the fake hash in a Proxy. Every indexed read (W[n])
+    // goes through our `get` trap, where we log the index. This is 100%
+    // reliable regardless of what the script does afterwards with the
+    // extracted character (charCodeAt, charAt, comparison, whatever).
     //
-    // Also: we hand the OF sign function our tagged hash directly via a
-    // custom SHA-1 stub, so the instance identity is preserved.
+    // The Proxy is handed to the sign function via the SHA-1 stub (module 89668).
     const bootstrap = `
         var __touched = [];
         var __FAKE_HASH = ${JSON.stringify(FAKE_HASH)};
 
-        // Create a tagged String subclass. Instances are String objects but
-        // carry a marker we can check in the charCodeAt hook.
-        function TaggedHash(s) {
-            var obj = Object.assign(Object(s), { __of_tagged: true });
-            return obj;
+        // Create a String object (so it has .length etc) wrapped in a Proxy.
+        // Every numeric property access records the index.
+        function makeTrackedHash() {
+            var boxed = Object(__FAKE_HASH);
+            return new Proxy(boxed, {
+                get: function(target, prop, receiver) {
+                    if (typeof prop === "string") {
+                        var asNum = Number(prop);
+                        if (Number.isInteger(asNum) && asNum >= 0 && asNum < __FAKE_HASH.length) {
+                            __touched.push(asNum);
+                            // Return the actual character from FAKE_HASH
+                            return __FAKE_HASH[asNum];
+                        }
+                    }
+                    // For .length, methods, etc — delegate to the boxed String
+                    var val = Reflect.get(target, prop, receiver);
+                    if (typeof val === "function") {
+                        return val.bind(target);
+                    }
+                    return val;
+                }
+            });
         }
-
-        // Hook charCodeAt to record index reads on tagged instances only
-        var __origCharCodeAt = String.prototype.charCodeAt;
-        String.prototype.charCodeAt = function(idx) {
-            if (this && this.__of_tagged === true) {
-                __touched.push(idx);
-            }
-            return __origCharCodeAt.call(this, idx);
-        };
-
-        // We also need to handle the case where the script does W.length on
-        // our tagged hash — it should return 40, not undefined.
-        // (String objects already have .length, so this works automatically.)
 
         // Browser-like globals
         var window = { navigator: { userAgent: "Mozilla/5.0" } };
@@ -133,8 +137,8 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
         function __fakeRequire(id) {
             switch (id) {
                 case 89668:
-                    // SHA-1 library: default export = function returning our TAGGED hash
-                    return function() { return TaggedHash(__FAKE_HASH); };
+                    // SHA-1 library: return our Proxy-wrapped fake hash
+                    return function() { return makeTrackedHash(); };
                 case 944114:
                     return function() { return ""; };
                 case 858156:
@@ -178,7 +182,7 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
             }
 
             if (typeof __nsObj.A === "function") {
-                // Reset the hook buffer for clean capture
+                // Reset the buffer for clean capture (in case Proxy was already hit during setup)
                 __touched.length = 0;
                 try {
                     __signResult = __nsObj.A({ url: "/api2/v2/users/me" });
@@ -282,10 +286,7 @@ function getRules(deobfSource: string, ast: t.Node, appToken: string): DynamicRu
     const rt = runChecksumFunction(deobfSource);
 
     if (!rt) {
-        console.error("[dynamic_rules] Stage 2 failed — aborting (not emitting partial rules)");
-        // IMPORTANT: if we can't get checksum, fail hard — a rules.json with empty
-        // indexes and constant=2016 is WORSE than no update at all. Better to
-        // retry on the next run than to commit garbage.
+        console.error("[dynamic_rules] Stage 2 failed — aborting (preserving old rules)");
         return undefined;
     }
 
