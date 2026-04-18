@@ -11,7 +11,6 @@ interface DynamicRules {
     prefix: string;
     suffix: string;
     static_param: string;
-    app_token: string;
     remove_headers: string[];
     checksum_indexes: number[];
     checksum_constant: number;
@@ -82,18 +81,10 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
     const sandbox: any = {};
     const ctx = vm.createContext(sandbox);
 
-    // STRATEGY: wrap the fake hash in a Proxy. Every indexed read (W[n])
-    // goes through our `get` trap, where we log the index. This is 100%
-    // reliable regardless of what the script does afterwards with the
-    // extracted character (charCodeAt, charAt, comparison, whatever).
-    //
-    // The Proxy is handed to the sign function via the SHA-1 stub (module 89668).
     const bootstrap = `
         var __touched = [];
         var __FAKE_HASH = ${JSON.stringify(FAKE_HASH)};
 
-        // Create a String object (so it has .length etc) wrapped in a Proxy.
-        // Every numeric property access records the index.
         function makeTrackedHash() {
             var boxed = Object(__FAKE_HASH);
             return new Proxy(boxed, {
@@ -102,11 +93,9 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
                         var asNum = Number(prop);
                         if (Number.isInteger(asNum) && asNum >= 0 && asNum < __FAKE_HASH.length) {
                             __touched.push(asNum);
-                            // Return the actual character from FAKE_HASH
                             return __FAKE_HASH[asNum];
                         }
                     }
-                    // For .length, methods, etc — delegate to the boxed String
                     var val = Reflect.get(target, prop, receiver);
                     if (typeof val === "function") {
                         return val.bind(target);
@@ -116,11 +105,9 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
             });
         }
 
-        // Browser-like globals
         var window = { navigator: { userAgent: "Mozilla/5.0" } };
         var global = globalThis;
 
-        // Webpack chunk collector
         var __registeredModules = [];
         var self = {
             webpackChunkof_vue: {
@@ -133,11 +120,9 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
             }
         };
 
-        // Fake webpack require
         function __fakeRequire(id) {
             switch (id) {
                 case 89668:
-                    // SHA-1 library: return our Proxy-wrapped fake hash
                     return function() { return makeTrackedHash(); };
                 case 944114:
                     return function() { return ""; };
@@ -161,7 +146,6 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
             return function() { return mod; };
         };
 
-        // Load OF deobfuscated script
         var __scriptLoadError = null;
         try {
             ${deobfSource}
@@ -169,7 +153,6 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
             __scriptLoadError = e.message;
         }
 
-        // Invoke the registered module
         var __signResult = null;
         var __invokeError = null;
         if (__registeredModules.length > 0) {
@@ -182,7 +165,6 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
             }
 
             if (typeof __nsObj.A === "function") {
-                // Reset the buffer for clean capture (in case Proxy was already hit during setup)
                 __touched.length = 0;
                 try {
                     __signResult = __nsObj.A({ url: "/api2/v2/users/me" });
@@ -269,7 +251,7 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
     return { checksum_indexes, checksum_constant };
 }
 
-function getRules(deobfSource: string, ast: t.Node, appToken: string): DynamicRules | undefined {
+function getRules(deobfSource: string, ast: t.Node): DynamicRules | undefined {
     const { prefix, suffix, staticParam } = extractBasicFields(ast);
 
     if (!prefix || !suffix || !staticParam) {
@@ -302,7 +284,6 @@ function getRules(deobfSource: string, ast: t.Node, appToken: string): DynamicRu
         prefix,
         suffix,
         static_param: staticParam,
-        app_token: appToken,
         remove_headers: ["user_id"],
         checksum_indexes: rt.checksum_indexes,
         checksum_constant: rt.checksum_constant,
@@ -311,7 +292,6 @@ function getRules(deobfSource: string, ast: t.Node, appToken: string): DynamicRu
 
 const deobfSource = readFileSync(process.argv[2], "utf8");
 const ast = parser.parse(deobfSource);
-const appToken = process.argv[3] || "";
-const rules = getRules(deobfSource, ast, appToken);
+const rules = getRules(deobfSource, ast);
 if (!rules) process.exit(1);
 console.log(JSON.stringify(rules));
