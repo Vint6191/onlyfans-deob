@@ -17,15 +17,11 @@ interface DynamicRules {
     checksum_constant: number;
 }
 
-// 40-char deterministic hash stand-in (SHA-1 hex length)
 const FAKE_HASH = "0123456789abcdefghijklmnopqrstuvwxyzABCD";
 if (FAKE_HASH.length !== 40) {
     throw new Error("FAKE_HASH must be 40 chars (got " + FAKE_HASH.length + ")");
 }
 
-/**
- * Extract prefix / suffix / static_param using stable AST patterns.
- */
 function extractBasicFields(ast: t.Node): {
     prefix?: string;
     suffix?: string;
@@ -82,154 +78,161 @@ interface RuntimeResult {
     checksum_constant: number;
 }
 
-/**
- * Run the ENTIRE deobfuscated script in a sandbox, then invoke its sign
- * function with a synthetic request. Hooks on charCodeAt and join let us
- * back-solve the checksum parameters.
- */
 function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
-    const touchedIndexes: number[] = [];
-    const joinResults: { sep: string; arr: any[] }[] = [];
-
-    // Build sandbox with real globals
-    const sandbox: any = {
-        Math, Date, JSON, console,
-        Array, Number, Boolean, Object, RegExp, String,
-        Error, TypeError, RangeError,
-        parseInt, parseFloat, isNaN, isFinite,
-        decodeURIComponent, encodeURIComponent, decodeURI, encodeURI,
-    };
-
-    // Fake browser globals
-    sandbox.window = { navigator: { userAgent: "Mozilla/5.0" } };
-    sandbox.globalThis = sandbox;
-
-    // Webpack chunk collector — intercepts module registration
-    const registeredModules: Array<{ id: number; fn: Function }> = [];
-    sandbox.self = {
-        webpackChunkof_vue: {
-            push(chunk: any) {
-                // chunk format: [[chunkIds], {moduleId: function(W,n,o){...}}]
-                const moduleMap = chunk[1];
-                for (const id of Object.keys(moduleMap)) {
-                    registeredModules.push({ id: Number(id), fn: moduleMap[id] });
-                }
-            },
-        },
-    };
-
-    sandbox.global = sandbox;
-    sandbox.__touched = touchedIndexes;
-    sandbox.__joins = joinResults;
-
+    const sandbox: any = {};
     const ctx = vm.createContext(sandbox);
 
-    // Install runtime hooks inside the VM
-    const installHooks = `
-        (function() {
-            const origCharCodeAt = String.prototype.charCodeAt;
-            String.prototype.charCodeAt = function(idx) {
-                if (this.valueOf() === ${JSON.stringify(FAKE_HASH)}) {
-                    globalThis.__touched.push(idx);
-                }
-                return origCharCodeAt.call(this, idx);
-            };
+    // KEY IDEA: Use a custom String SUBCLASS for the fake hash, and only hook
+    // charCodeAt on instances of that subclass. This is 100% reliable —
+    // no valueOf() comparisons, no race conditions with Sentry or whatever.
+    //
+    // Also: we hand the OF sign function our tagged hash directly via a
+    // custom SHA-1 stub, so the instance identity is preserved.
+    const bootstrap = `
+        var __touched = [];
+        var __FAKE_HASH = ${JSON.stringify(FAKE_HASH)};
 
-            const origJoin = Array.prototype.join;
-            Array.prototype.join = function(sep) {
-                if (sep === "\\n" || sep === ":") {
-                    globalThis.__joins.push({ sep: sep, arr: Array.from(this) });
+        // Create a tagged String subclass. Instances are String objects but
+        // carry a marker we can check in the charCodeAt hook.
+        function TaggedHash(s) {
+            var obj = Object.assign(Object(s), { __of_tagged: true });
+            return obj;
+        }
+
+        // Hook charCodeAt to record index reads on tagged instances only
+        var __origCharCodeAt = String.prototype.charCodeAt;
+        String.prototype.charCodeAt = function(idx) {
+            if (this && this.__of_tagged === true) {
+                __touched.push(idx);
+            }
+            return __origCharCodeAt.call(this, idx);
+        };
+
+        // We also need to handle the case where the script does W.length on
+        // our tagged hash — it should return 40, not undefined.
+        // (String objects already have .length, so this works automatically.)
+
+        // Browser-like globals
+        var window = { navigator: { userAgent: "Mozilla/5.0" } };
+        var global = globalThis;
+
+        // Webpack chunk collector
+        var __registeredModules = [];
+        var self = {
+            webpackChunkof_vue: {
+                push: function(chunk) {
+                    var moduleMap = chunk[1];
+                    for (var id in moduleMap) {
+                        __registeredModules.push({ id: Number(id), fn: moduleMap[id] });
+                    }
                 }
-                return origJoin.call(this, sep);
-            };
-        })();
+            }
+        };
+
+        // Fake webpack require
+        function __fakeRequire(id) {
+            switch (id) {
+                case 89668:
+                    // SHA-1 library: default export = function returning our TAGGED hash
+                    return function() { return TaggedHash(__FAKE_HASH); };
+                case 944114:
+                    return function() { return ""; };
+                case 858156:
+                    return function(obj, path, dflt) {
+                        try {
+                            return path.split(".").reduce(function(o, p) {
+                                return o == null ? undefined : o[p];
+                            }, obj) || dflt;
+                        } catch(e) { return dflt; }
+                    };
+                case 441153:
+                    return { A: { getters: { "auth/authUserId": 42 } } };
+                default:
+                    return {};
+            }
+        }
+        __fakeRequire.n = function(mod) {
+            if (typeof mod === "function") return function() { return mod; };
+            if (mod && typeof mod.A === "function") return function() { return mod.A; };
+            return function() { return mod; };
+        };
+
+        // Load OF deobfuscated script
+        var __scriptLoadError = null;
+        try {
+            ${deobfSource}
+        } catch(e) {
+            __scriptLoadError = e.message;
+        }
+
+        // Invoke the registered module
+        var __signResult = null;
+        var __invokeError = null;
+        if (__registeredModules.length > 0) {
+            var __mod = __registeredModules[__registeredModules.length - 1];
+            var __nsObj = {};
+            try {
+                __mod.fn({}, __nsObj, __fakeRequire);
+            } catch(e) {
+                __invokeError = "module fn threw: " + e.message;
+            }
+
+            if (typeof __nsObj.A === "function") {
+                // Reset the hook buffer for clean capture
+                __touched.length = 0;
+                try {
+                    __signResult = __nsObj.A({ url: "/api2/v2/users/me" });
+                } catch(e) {
+                    __invokeError = "sign call threw: " + e.message;
+                }
+            } else if (!__invokeError) {
+                __invokeError = "no n.A function (keys: " + Object.keys(__nsObj).join(",") + ")";
+            }
+        } else {
+            __invokeError = "no modules registered";
+        }
+
+        globalThis.__result = {
+            touched: __touched.slice(),
+            signResult: __signResult,
+            invokeError: __invokeError,
+            scriptLoadError: __scriptLoadError,
+            moduleCount: __registeredModules.length,
+        };
     `;
 
     try {
-        vm.runInContext(installHooks, ctx);
+        vm.runInContext(bootstrap, ctx);
     } catch (e: any) {
-        console.error("[runtime] hook install failed:", e?.message);
+        console.error("[runtime] bootstrap threw:", e?.message?.slice(0, 300));
         return;
     }
 
-    // Load the entire deobfuscated script. This triggers webpackChunkof_vue.push(...)
-    try {
-        vm.runInContext(deobfSource, ctx);
-    } catch (e: any) {
-        console.error("[runtime] script load warning:", e?.message?.slice(0, 200));
-        // Continue — the important part (module registration) may still have happened
-    }
-
-    if (!registeredModules.length) {
-        console.error("[runtime] no modules registered via webpackChunkof_vue");
+    const result = sandbox.__result;
+    if (!result) {
+        console.error("[runtime] no result exported from VM");
         return;
     }
 
-    // Invoke the module with a fake webpack require
-    const mod = registeredModules[registeredModules.length - 1];
-    console.error("[runtime] invoking module id:", mod.id);
+    if (result.scriptLoadError) {
+        console.error("[runtime] script load error:", result.scriptLoadError.slice(0, 200));
+    }
+    console.error("[runtime] modules registered:", result.moduleCount);
 
-    const fakeRequire: any = (id: number) => {
-        switch (id) {
-            case 89668:  // SHA-1 library: default export = function that returns hash
-                return function () { return FAKE_HASH; };
-            case 944114: // Helper — return a permissive function
-                return function () { return ""; };
-            case 858156: // get(obj, path, default)
-                return function (obj: any, path: string, dflt: any) {
-                    try {
-                        return path.split(".").reduce((o: any, p: string) => o?.[p], obj) ?? dflt;
-                    } catch { return dflt; }
-                };
-            case 441153: // auth store
-                return { A: { getters: { "auth/authUserId": 42 } } };
-            default:
-                return {};
-        }
-    };
-    // webpack's `o.n` helper — returns a function that returns the module's default export
-    fakeRequire.n = (mod: any) => {
-        if (typeof mod === "function") return () => mod;
-        if (mod && typeof mod.A === "function") return () => mod.A;
-        return () => mod;
-    };
-
-    // Run the module function: function(W, n, o) { ...assigns n.A = ...; }
-    const nsObj: any = {};
-    try {
-        mod.fn({}, nsObj, fakeRequire);
-    } catch (e: any) {
-        console.error("[runtime] module function threw:", e?.message?.slice(0, 200));
+    if (result.invokeError) {
+        console.error("[runtime] invoke error:", result.invokeError.slice(0, 300));
         return;
     }
 
-    if (typeof nsObj.A !== "function") {
-        console.error("[runtime] module did not export a sign function; keys:", Object.keys(nsObj));
-        return;
-    }
-
-    // Clear hook buffers before the real call (we don't care about setup-time joins)
-    touchedIndexes.length = 0;
-    joinResults.length = 0;
-
-    // Call the sign function with a synthetic request
-    let signResult: any;
-    try {
-        signResult = nsObj.A({ url: "/api2/v2/users/me" });
-    } catch (e: any) {
-        console.error("[runtime] sign call threw:", e?.message?.slice(0, 200));
-        return;
-    }
-
-    // signResult = { time: ..., sign: "prefix:hash:checksum:suffix" }
+    const signResult = result.signResult;
     if (!signResult || typeof signResult.sign !== "string") {
-        console.error("[runtime] sign call returned unexpected value:", signResult);
+        console.error("[runtime] unexpected sign result:", signResult);
         return;
     }
 
     const signParts = signResult.sign.split(":");
     if (signParts.length !== 4) {
-        console.error("[runtime] unexpected sign format:", signResult.sign);
+        console.error("[runtime] unexpected sign format (parts=" + signParts.length + "):", signResult.sign);
         return;
     }
 
@@ -240,8 +243,15 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
         return;
     }
 
-    // Back-solve constant from: result = Σ(charCode[idx] + constantPart)
-    // Sum all charCodes at touched indexes; constant = result - sum
+    const touchedIndexes: number[] = result.touched;
+    console.error("[runtime] touched indexes count:", touchedIndexes.length);
+    console.error("[runtime] checksum hex:", checksumHex, "= decimal", checksumDecimal);
+
+    if (touchedIndexes.length === 0) {
+        console.error("[runtime] WARNING: no indexes captured — hook did not fire!");
+        return;
+    }
+
     const sumOfCharCodes = touchedIndexes.reduce(
         (acc, idx) => acc + FAKE_HASH.charCodeAt(idx % FAKE_HASH.length),
         0,
@@ -249,10 +259,8 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
     const checksum_constant = checksumDecimal - sumOfCharCodes;
     const checksum_indexes = touchedIndexes.map(i => ((i % 40) + 40) % 40);
 
-    console.error(
-        "[runtime] captured: indexes.length=" + checksum_indexes.length +
-        " sign=" + signResult.sign,
-    );
+    console.error("[runtime] sum of charCodes:", sumOfCharCodes);
+    console.error("[runtime] computed constant:", checksum_constant);
 
     return { checksum_indexes, checksum_constant };
 }
@@ -265,8 +273,7 @@ function getRules(deobfSource: string, ast: t.Node, appToken: string): DynamicRu
             "[dynamic_rules] Stage 1 failed.\n" +
             "  prefix       = " + prefix + "\n" +
             "  suffix       = " + suffix + "\n" +
-            "  static_param = " + staticParam + "\n" +
-            "OF script structure changed beyond basic .join() patterns."
+            "  static_param = " + staticParam
         );
         return undefined;
     }
@@ -275,19 +282,11 @@ function getRules(deobfSource: string, ast: t.Node, appToken: string): DynamicRu
     const rt = runChecksumFunction(deobfSource);
 
     if (!rt) {
-        console.error("[dynamic_rules] Stage 2 failed: returning partial rules");
-        return {
-            end: suffix,
-            start: prefix,
-            format: prefix + ":{}:{:x}:" + suffix,
-            prefix,
-            suffix,
-            static_param: staticParam,
-            app_token: appToken,
-            remove_headers: ["user_id"],
-            checksum_indexes: [],
-            checksum_constant: 0,
-        };
+        console.error("[dynamic_rules] Stage 2 failed — aborting (not emitting partial rules)");
+        // IMPORTANT: if we can't get checksum, fail hard — a rules.json with empty
+        // indexes and constant=2016 is WORSE than no update at all. Better to
+        // retry on the next run than to commit garbage.
+        return undefined;
     }
 
     console.error(
