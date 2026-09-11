@@ -176,11 +176,16 @@ function shuffleObfuscatedStrings(
   return true;
 }
 
-function replaceAllWrapperCalls(ast: t.Node, wrapperNames: Set<string>, collector: SetupCollector) {
+function replaceAllWrapperCalls(
+  ast: t.Node,
+  wrapperNames: Set<string>,
+  wrapperReferenceNodes: WeakSet<t.Identifier>,
+  collector: SetupCollector,
+) {
   let replaced = 0;
   let skipped = 0;
   let visited = 0;
-  let shadowed = 0;
+  let foreignSameName = 0;
 
   traverse(ast, {
     CallExpression(path) {
@@ -190,12 +195,13 @@ function replaceAllWrapperCalls(ast: t.Node, wrapperNames: Set<string>, collecto
       if (!wrapperNames.has(callee.name)) return;
       visited++;
 
-      // Wrapper declarations are removed from the AST before this pass.
-      // If the same identifier is bound in the current lexical scope (for
-      // example webpack's local `o` require parameter), it is NOT our decrypt
-      // wrapper and must never be executed in the decrypt VM.
-      if (path.scope.getBinding(callee.name)) {
-        shadowed++;
+      // Match by the ORIGINAL Babel binding identity, captured while the
+      // wrapper declaration still exists.  Looking up bindings after removing
+      // the wrapper is wrong: Babel then resolves the same identifier to an
+      // outer binding (for example webpack's `o` require or a module import
+      // named `r`) and genuine decrypt calls look "shadowed".
+      if (!wrapperReferenceNodes.has(callee)) {
+        foreignSameName++;
         skipped++;
         return;
       }
@@ -239,7 +245,27 @@ function replaceAllWrapperCalls(ast: t.Node, wrapperNames: Set<string>, collecto
       }
     },
   });
-  log(`replaceAllWrapperCalls -> visited: ${visited} replaced: ${replaced} skipped: ${skipped} shadowed: ${shadowed}`);
+  log(`replaceAllWrapperCalls -> visited: ${visited} replaced: ${replaced} skipped: ${skipped} foreign-same-name: ${foreignSameName}`);
+}
+
+function captureWrapperBindingReferences(
+  path: NodePath,
+  name: string,
+  target: WeakSet<t.Identifier>,
+): number {
+  const binding = path.scope.getBinding(name);
+  if (!binding) {
+    log("wrapper binding not found while declaration is still present:", name);
+    return 0;
+  }
+
+  let captured = 0;
+  for (const ref of binding.referencePaths) {
+    if (!ref.isIdentifier({ name })) continue;
+    target.add(ref.node);
+    captured++;
+  }
+  return captured;
 }
 
 enum MapFuncType { CallOneArg, CallThreeArg }
@@ -386,6 +412,7 @@ function deobfuscate(source: string) {
   let baseDecryptFunc: string | undefined;
   let foundShuffle = false;
   const wrapperNames = new Set<string>();
+  const wrapperReferenceNodes = new WeakSet<t.Identifier>();
 
   // 1. Find string array
   log("BEGIN findObfuscatedStrings");
@@ -446,6 +473,18 @@ function deobfuscate(source: string) {
 
     for (const w of toCollect) {
       if (wrapperNames.has(w.name)) continue;
+
+      // Capture references BEFORE removing the declaration.  These Node
+      // identities survive removal of the declaration itself and let the
+      // replacement pass distinguish real wrapper calls from unrelated
+      // same-named locals in outer scopes.
+      const capturedRefs = captureWrapperBindingReferences(
+        w.path,
+        w.name,
+        wrapperReferenceNodes,
+      );
+      log(`  pass ${pass} -> captured ${capturedRefs} refs for wrapper:`, w.name);
+
       wrapperNames.add(w.name);
       foundThisPass++;
       if (w.path.isFunctionDeclaration()) {
@@ -465,21 +504,11 @@ function deobfuscate(source: string) {
 
   collector.flush();
 
-  // Wrapper nodes were removed above. Rebuild scope bindings so calls to a
-  // same-named local parameter (notably webpack's require alias) are not
-  // mistaken for decrypt-wrapper calls.
-  traverse(ast, {
-    Program(path) {
-      path.scope.crawl();
-      path.stop();
-    },
-  });
-
   // 4. Replace wrapper calls
   log("BEGIN replace wrapper calls");
   const userWrappers = new Set(wrapperNames);
   userWrappers.delete(baseDecryptFunc);
-  replaceAllWrapperCalls(ast, userWrappers, collector);
+  replaceAllWrapperCalls(ast, userWrappers, wrapperReferenceNodes, collector);
   log("END replace wrapper calls");
 
   // 5. Operator map — CAREFUL: don't remove the map if we couldn't consume its usages,
