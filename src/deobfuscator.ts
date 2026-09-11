@@ -180,6 +180,7 @@ function replaceAllWrapperCalls(ast: t.Node, wrapperNames: Set<string>, collecto
   let replaced = 0;
   let skipped = 0;
   let visited = 0;
+  let shadowed = 0;
 
   traverse(ast, {
     CallExpression(path) {
@@ -188,6 +189,16 @@ function replaceAllWrapperCalls(ast: t.Node, wrapperNames: Set<string>, collecto
       if (!t.isIdentifier(callee)) return;
       if (!wrapperNames.has(callee.name)) return;
       visited++;
+
+      // Wrapper declarations are removed from the AST before this pass.
+      // If the same identifier is bound in the current lexical scope (for
+      // example webpack's local `o` require parameter), it is NOT our decrypt
+      // wrapper and must never be executed in the decrypt VM.
+      if (path.scope.getBinding(callee.name)) {
+        shadowed++;
+        skipped++;
+        return;
+      }
 
       if (t.isReturnStatement(path.parentPath?.node)) {
         const fn = path.getFunctionParent();
@@ -228,7 +239,7 @@ function replaceAllWrapperCalls(ast: t.Node, wrapperNames: Set<string>, collecto
       }
     },
   });
-  log(`replaceAllWrapperCalls -> visited: ${visited} replaced: ${replaced} skipped: ${skipped}`);
+  log(`replaceAllWrapperCalls -> visited: ${visited} replaced: ${replaced} skipped: ${skipped} shadowed: ${shadowed}`);
 }
 
 enum MapFuncType { CallOneArg, CallThreeArg }
@@ -453,6 +464,16 @@ function deobfuscate(source: string) {
   log("END find wrappers");
 
   collector.flush();
+
+  // Wrapper nodes were removed above. Rebuild scope bindings so calls to a
+  // same-named local parameter (notably webpack's require alias) are not
+  // mistaken for decrypt-wrapper calls.
+  traverse(ast, {
+    Program(path) {
+      path.scope.crawl();
+      path.stop();
+    },
+  });
 
   // 4. Replace wrapper calls
   log("BEGIN replace wrapper calls");

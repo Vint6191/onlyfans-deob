@@ -45,6 +45,9 @@ jobs:
       - name: Build TypeScript
         run: npm run build
 
+      - name: Run regression tests
+        run: node ./tests/regression.js
+
       - name: Download obfuscated script
         run: |
           set -e

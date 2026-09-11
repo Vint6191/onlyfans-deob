@@ -1,6 +1,7 @@
 import * as parser from "@babel/parser";
 import traverse from "@babel/traverse";
 import * as t from "@babel/types";
+import generate from "@babel/generator";
 import { readFileSync } from "fs";
 import vm from "vm";
 
@@ -77,7 +78,98 @@ interface RuntimeResult {
     checksum_constant: number;
 }
 
-function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
+/**
+ * Find the checksum IIFE directly inside the final colon-joined sign value.
+ *
+ * Important: webpack numeric module ids are build-local implementation details.
+ * Stage 2 must not execute the whole webpack module or emulate its imports just
+ * to reach the checksum.  The checksum function is already present in the
+ * deobfuscated AST, so execute only that function with a tracked 40-char hash.
+ */
+function findChecksumFunctionSource(ast: t.Node): string | undefined {
+    let found: string | undefined;
+
+    traverse(ast, {
+        CallExpression(path) {
+            if (found) {
+                path.stop();
+                return;
+            }
+
+            const node = path.node;
+            if (!t.isMemberExpression(node.callee)) return;
+            if (!t.isIdentifier(node.callee.property, { name: "join" })) return;
+            if (node.arguments.length !== 1) return;
+            if (!t.isStringLiteral(node.arguments[0], { value: ":" })) return;
+            if (!t.isArrayExpression(node.callee.object)) return;
+
+            const elems = node.callee.object.elements;
+            if (elems.length < 4) return;
+
+            const firstElem = elems[0];
+            const hashElem = elems[1];
+            const checksumElem = elems[2];
+            const lastElem = elems[elems.length - 1];
+
+            const hasNumericPrefix =
+                (t.isStringLiteral(firstElem) && !isNaN(Number(firstElem.value))) ||
+                t.isNumericLiteral(firstElem);
+            const hasHexSuffix =
+                t.isStringLiteral(lastElem) && /^[0-9a-f]+$/i.test(lastElem.value);
+            if (!hasNumericPrefix || !hasHexSuffix) return;
+
+            // Dynamic-rules sign layout is [prefix, hash, checksum(hash), suffix].
+            // We intentionally identify the checksum by semantic shape rather
+            // than by webpack require/module ids.
+            if (!t.isExpression(hashElem) || !t.isCallExpression(checksumElem)) return;
+            if (checksumElem.arguments.length !== 1 || !t.isExpression(checksumElem.arguments[0])) return;
+            if (generate(hashElem).code !== generate(checksumElem.arguments[0]).code) return;
+
+            const checksumFn = checksumElem.callee;
+            if (!t.isFunctionExpression(checksumFn) && !t.isArrowFunctionExpression(checksumFn)) {
+                return;
+            }
+            if (checksumFn.params.length !== 1 || !t.isIdentifier(checksumFn.params[0])) return;
+
+            let hasCharCodeAt = false;
+            let hasHexToString = false;
+            t.traverseFast(checksumFn.body, (child) => {
+                if (!t.isCallExpression(child) || !t.isMemberExpression(child.callee)) return;
+
+                if (
+                    t.isIdentifier(child.callee.property, { name: "charCodeAt" }) &&
+                    child.arguments.length === 1 &&
+                    t.isNumericLiteral(child.arguments[0], { value: 0 })
+                ) {
+                    hasCharCodeAt = true;
+                }
+
+                if (
+                    t.isIdentifier(child.callee.property, { name: "toString" }) &&
+                    child.arguments.length === 1 &&
+                    t.isNumericLiteral(child.arguments[0], { value: 16 })
+                ) {
+                    hasHexToString = true;
+                }
+            });
+
+            if (!hasCharCodeAt || !hasHexToString) return;
+
+            found = generate(checksumFn).code;
+            path.stop();
+        },
+    });
+
+    return found;
+}
+
+function runChecksumFunction(ast: t.Node): RuntimeResult | undefined {
+    const checksumFunctionSource = findChecksumFunctionSource(ast);
+    if (!checksumFunctionSource) {
+        console.error("[runtime] checksum function not found in sign expression");
+        return;
+    }
+
     const sandbox: any = {};
     const ctx = vm.createContext(sandbox);
 
@@ -105,85 +197,18 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
             });
         }
 
-        var window = { navigator: { userAgent: "Mozilla/5.0" } };
-        var global = globalThis;
-
-        var __registeredModules = [];
-        var self = {
-            webpackChunkof_vue: {
-                push: function(chunk) {
-                    var moduleMap = chunk[1];
-                    for (var id in moduleMap) {
-                        __registeredModules.push({ id: Number(id), fn: moduleMap[id] });
-                    }
-                }
-            }
-        };
-
-        function __fakeRequire(id) {
-            switch (id) {
-                case 89668:
-                    return function() { return makeTrackedHash(); };
-                case 944114:
-                    return function() { return ""; };
-                case 858156:
-                    return function(obj, path, dflt) {
-                        try {
-                            return path.split(".").reduce(function(o, p) {
-                                return o == null ? undefined : o[p];
-                            }, obj) || dflt;
-                        } catch(e) { return dflt; }
-                    };
-                case 441153:
-                    return { A: { getters: { "auth/authUserId": 42 } } };
-                default:
-                    return {};
-            }
-        }
-        __fakeRequire.n = function(mod) {
-            if (typeof mod === "function") return function() { return mod; };
-            if (mod && typeof mod.A === "function") return function() { return mod.A; };
-            return function() { return mod; };
-        };
-
-        var __scriptLoadError = null;
-        try {
-            ${deobfSource}
-        } catch(e) {
-            __scriptLoadError = e.message;
-        }
-
-        var __signResult = null;
+        var __checksumHex = null;
         var __invokeError = null;
-        if (__registeredModules.length > 0) {
-            var __mod = __registeredModules[__registeredModules.length - 1];
-            var __nsObj = {};
-            try {
-                __mod.fn({}, __nsObj, __fakeRequire);
-            } catch(e) {
-                __invokeError = "module fn threw: " + e.message;
-            }
-
-            if (typeof __nsObj.A === "function") {
-                __touched.length = 0;
-                try {
-                    __signResult = __nsObj.A({ url: "/api2/v2/users/me" });
-                } catch(e) {
-                    __invokeError = "sign call threw: " + e.message;
-                }
-            } else if (!__invokeError) {
-                __invokeError = "no n.A function (keys: " + Object.keys(__nsObj).join(",") + ")";
-            }
-        } else {
-            __invokeError = "no modules registered";
+        try {
+            __checksumHex = (${checksumFunctionSource})(makeTrackedHash());
+        } catch(e) {
+            __invokeError = e && e.message ? e.message : String(e);
         }
 
         globalThis.__result = {
             touched: __touched.slice(),
-            signResult: __signResult,
+            checksumHex: __checksumHex,
             invokeError: __invokeError,
-            scriptLoadError: __scriptLoadError,
-            moduleCount: __registeredModules.length,
         };
     `;
 
@@ -200,29 +225,17 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
         return;
     }
 
-    if (result.scriptLoadError) {
-        console.error("[runtime] script load error:", result.scriptLoadError.slice(0, 200));
-    }
-    console.error("[runtime] modules registered:", result.moduleCount);
-
     if (result.invokeError) {
-        console.error("[runtime] invoke error:", result.invokeError.slice(0, 300));
+        console.error("[runtime] checksum call threw:", String(result.invokeError).slice(0, 300));
         return;
     }
 
-    const signResult = result.signResult;
-    if (!signResult || typeof signResult.sign !== "string") {
-        console.error("[runtime] unexpected sign result:", signResult);
+    const checksumHex = result.checksumHex;
+    if (typeof checksumHex !== "string" || !/^[0-9a-f]+$/i.test(checksumHex)) {
+        console.error("[runtime] checksum is not a hex string:", checksumHex);
         return;
     }
 
-    const signParts = signResult.sign.split(":");
-    if (signParts.length !== 4) {
-        console.error("[runtime] unexpected sign format (parts=" + signParts.length + "):", signResult.sign);
-        return;
-    }
-
-    const checksumHex = signParts[2];
     const checksumDecimal = parseInt(checksumHex, 16);
     if (Number.isNaN(checksumDecimal)) {
         console.error("[runtime] checksum not parseable as hex:", checksumHex);
@@ -230,6 +243,7 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
     }
 
     const touchedIndexes: number[] = result.touched;
+    console.error("[runtime] checksum strategy: direct semantic IIFE");
     console.error("[runtime] touched indexes count:", touchedIndexes.length);
     console.error("[runtime] checksum hex:", checksumHex, "= decimal", checksumDecimal);
 
@@ -251,7 +265,7 @@ function runChecksumFunction(deobfSource: string): RuntimeResult | undefined {
     return { checksum_indexes, checksum_constant };
 }
 
-function getRules(deobfSource: string, ast: t.Node): DynamicRules | undefined {
+function getRules(ast: t.Node): DynamicRules | undefined {
     const { prefix, suffix, staticParam } = extractBasicFields(ast);
 
     if (!prefix || !suffix || !staticParam) {
@@ -265,7 +279,7 @@ function getRules(deobfSource: string, ast: t.Node): DynamicRules | undefined {
     }
     console.error("[dynamic_rules] Stage 1 OK: prefix=" + prefix + " suffix=" + suffix);
 
-    const rt = runChecksumFunction(deobfSource);
+    const rt = runChecksumFunction(ast);
 
     if (!rt) {
         console.error("[dynamic_rules] Stage 2 failed — aborting (preserving old rules)");
@@ -292,6 +306,6 @@ function getRules(deobfSource: string, ast: t.Node): DynamicRules | undefined {
 
 const deobfSource = readFileSync(process.argv[2], "utf8");
 const ast = parser.parse(deobfSource);
-const rules = getRules(deobfSource, ast);
+const rules = getRules(ast);
 if (!rules) process.exit(1);
 console.log(JSON.stringify(rules));
