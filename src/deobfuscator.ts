@@ -1,11 +1,14 @@
 /* src/deobfuscator.ts */
 import * as parser from "@babel/parser";
-import traverse, { Binding, NodePath, Scope } from "@babel/traverse";
+import traverse, { NodePath, Scope } from "@babel/traverse";
 import * as t from "@babel/types";
 import generate from "@babel/generator";
 import beautify from "js-beautify";
-import { readFileSync, writeFile } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import vm from "vm";
+import { captureDeclarationReferences } from "./declaration-binding";
+
+const VM_TIMEOUT_MS = 2000;
 
 const binop = [
   "+", "-", "/", "%", "*", "**", "&", "|", ">>", ">>>", "<<", "^",
@@ -40,15 +43,16 @@ class SetupCollector {
     const combined = this.snippets.join(";\n");
     this.snippets = [];
     try {
-      vm.runInContext(combined, this.ctx);
+      vm.runInContext(combined, this.ctx, { timeout: VM_TIMEOUT_MS });
       log("flush OK, snippets combined length:", combined.length);
     } catch (e: any) {
       log("flush error:", e?.message);
       log("code start:", combined.slice(0, 300));
+      throw new Error(`Decoder setup failed: ${e?.message ?? String(e)}`);
     }
   }
   run(code: string): any {
-    try { return vm.runInContext(code, this.ctx); }
+    try { return vm.runInContext(code, this.ctx, { timeout: VM_TIMEOUT_MS }); }
     catch (e: any) {
       if (this.errCount < 5) {
         log("vm.run error:", e?.message, "| code:", code.slice(0, 200));
@@ -90,6 +94,7 @@ function findBaseDecryptFunction(
   path: NodePath<t.FunctionDeclaration>,
   collector: SetupCollector,
   funcObfStrings: string,
+  wrapperReferenceNodes: WeakSet<t.Identifier>,
 ): string | undefined {
   if (!path.node) return;
   const node = path.node;
@@ -105,7 +110,9 @@ function findBaseDecryptFunction(
     });
   });
   if (!usesObfStrings) return;
-  log("findBaseDecryptFunction -> accepted:", node.id.name, "stmts:", body.length);
+  // Direct base-decoder calls need the same identity protection as wrappers.
+  const captured = captureDeclarationReferences(path, node.id.name, wrapperReferenceNodes);
+  log("findBaseDecryptFunction -> accepted:", node.id.name, "stmts:", body.length, "refs:", captured);
   collector.add(generate(node).code);
   path.remove();
   return node.id.name;
@@ -114,6 +121,7 @@ function findBaseDecryptFunction(
 function tryWrapperDecl(
   path: NodePath<t.FunctionDeclaration>,
   knownWrappers: Set<string>,
+  wrapperReferenceNodes: WeakSet<t.Identifier>,
 ): string | undefined {
   if (!path.node) return;
   const node = path.node;
@@ -125,6 +133,9 @@ function tryWrapperDecl(
   const call = ret.argument as t.CallExpression;
   if (!t.isIdentifier(call.callee)) return;
   if (!knownWrappers.has(call.callee.name)) return;
+  // A function returning a same-named webpack/import call is NOT a decoder
+  // wrapper. Its callee must refer to an already captured decoder declaration.
+  if (!wrapperReferenceNodes.has(call.callee)) return;
   if (!node.id) return;
   return node.id.name;
 }
@@ -132,6 +143,7 @@ function tryWrapperDecl(
 function tryWrapperVar(
   path: NodePath<t.VariableDeclarator>,
   knownWrappers: Set<string>,
+  wrapperReferenceNodes: WeakSet<t.Identifier>,
 ): string | undefined {
   if (!path.node) return;
   const node = path.node;
@@ -151,6 +163,9 @@ function tryWrapperVar(
   const call = stmt.argument as t.CallExpression;
   if (!t.isIdentifier(call.callee)) return;
   if (!knownWrappers.has(call.callee.name)) return;
+  // A function returning a same-named webpack/import call is NOT a decoder
+  // wrapper. Its callee must refer to an already captured decoder declaration.
+  if (!wrapperReferenceNodes.has(call.callee)) return;
   return node.id.name;
 }
 
@@ -206,14 +221,6 @@ function replaceAllWrapperCalls(
         return;
       }
 
-      if (t.isReturnStatement(path.parentPath?.node)) {
-        const fn = path.getFunctionParent();
-        if (fn && t.isFunctionDeclaration(fn.node) && fn.node.id && wrapperNames.has(fn.node.id.name)) {
-          skipped++;
-          return;
-        }
-      }
-
       const argCodes: string[] = [];
       let allConfident = true;
       path.get("arguments").forEach((arg) => {
@@ -246,26 +253,27 @@ function replaceAllWrapperCalls(
     },
   });
   log(`replaceAllWrapperCalls -> visited: ${visited} replaced: ${replaced} skipped: ${skipped} foreign-same-name: ${foreignSameName}`);
-}
 
-function captureWrapperBindingReferences(
-  path: NodePath,
-  name: string,
-  target: WeakSet<t.Identifier>,
-): number {
-  const binding = path.scope.getBinding(name);
-  if (!binding) {
-    log("wrapper binding not found while declaration is still present:", name);
-    return 0;
+  // Only original references to extracted declarations count. Unrelated
+  // webpack/import calls with the same spelling must remain untouched.
+  // Never publish a JS file after deleting a decoder that it still needs.
+  let unresolved = 0;
+  const examples: string[] = [];
+  traverse(ast, {
+    ReferencedIdentifier(path) {
+      if (!t.isIdentifier(path.node) || !wrapperReferenceNodes.has(path.node)) return;
+      unresolved++;
+      if (examples.length < 3) {
+        examples.push(generate(path.parentPath?.node ?? path.node).code.slice(0, 160));
+      }
+    },
+  });
+  if (unresolved > 0) {
+    throw new Error(
+      `Unresolved decoder references: ${unresolved}. Refusing to write incomplete output. ` +
+      examples.join(" | "),
+    );
   }
-
-  let captured = 0;
-  for (const ref of binding.referencePaths) {
-    if (!ref.isIdentifier({ name })) continue;
-    target.add(ref.node);
-    captured++;
-  }
-  return captured;
 }
 
 enum MapFuncType { CallOneArg, CallThreeArg }
@@ -423,14 +431,14 @@ function deobfuscate(source: string) {
     },
   });
   log("END findObfuscatedStrings ->", funcObfStrings ?? "NOT FOUND");
-  if (!funcObfStrings) { console.error("String array not found!"); return; }
+  if (!funcObfStrings) throw new Error("String array not found");
 
   // 2. Find base decrypt function + shuffle
   log("BEGIN find base + shuffle");
   traverse(ast, {
     FunctionDeclaration(path) {
       if (!baseDecryptFunc) {
-        const name = findBaseDecryptFunction(path, collector, funcObfStrings!);
+        const name = findBaseDecryptFunction(path, collector, funcObfStrings!, wrapperReferenceNodes);
         if (name) { baseDecryptFunc = name; log("baseDecryptFunc:", name); }
       }
     },
@@ -443,8 +451,7 @@ function deobfuscate(source: string) {
   });
   log("END find base + shuffle");
   if (!baseDecryptFunc || !foundShuffle) {
-    console.error("Base decrypt func or shuffle missing — aborting");
-    return;
+    throw new Error("Base decrypt func or shuffle missing — aborting");
   }
   wrapperNames.add(baseDecryptFunc);
 
@@ -456,14 +463,14 @@ function deobfuscate(source: string) {
 
     traverse(ast, {
       FunctionDeclaration(path) {
-        const name = tryWrapperDecl(path as NodePath<t.FunctionDeclaration>, wrapperNames);
+        const name = tryWrapperDecl(path as NodePath<t.FunctionDeclaration>, wrapperNames, wrapperReferenceNodes);
         if (name && !wrapperNames.has(name)) {
           log(`  pass ${pass} -> FunctionDecl wrapper:`, name);
           toCollect.push({ name, path });
         }
       },
       VariableDeclarator(path) {
-        const name = tryWrapperVar(path as NodePath<t.VariableDeclarator>, wrapperNames);
+        const name = tryWrapperVar(path as NodePath<t.VariableDeclarator>, wrapperNames, wrapperReferenceNodes);
         if (name && !wrapperNames.has(name)) {
           log(`  pass ${pass} -> VarDecl wrapper:`, name);
           toCollect.push({ name, path });
@@ -478,7 +485,7 @@ function deobfuscate(source: string) {
       // identities survive removal of the declaration itself and let the
       // replacement pass distinguish real wrapper calls from unrelated
       // same-named locals in outer scopes.
-      const capturedRefs = captureWrapperBindingReferences(
+      const capturedRefs = captureDeclarationReferences(
         w.path,
         w.name,
         wrapperReferenceNodes,
@@ -506,9 +513,7 @@ function deobfuscate(source: string) {
 
   // 4. Replace wrapper calls
   log("BEGIN replace wrapper calls");
-  const userWrappers = new Set(wrapperNames);
-  userWrappers.delete(baseDecryptFunc);
-  replaceAllWrapperCalls(ast, userWrappers, wrapperReferenceNodes, collector);
+  replaceAllWrapperCalls(ast, wrapperNames, wrapperReferenceNodes, collector);
   log("END replace wrapper calls");
 
   // 5. Operator map — CAREFUL: don't remove the map if we couldn't consume its usages,
@@ -564,11 +569,17 @@ function deobfuscate(source: string) {
   log("END generate+beautify");
 
   const outputPath = process.argv[3];
-  writeFile(outputPath, code, (err) => {
-    if (err) { console.error("Error writing file", err); return; }
-    log("Wrote file to", outputPath);
-  });
+  writeFileSync(outputPath, code, "utf8");
+  log("Wrote file to", outputPath);
 }
 
-log("argv:", process.argv.slice(2).join(" "));
-deobfuscate(readFileSync(process.argv[2], "utf8"));
+try {
+  if (process.argv.length !== 4) {
+    throw new Error("Usage: node build/deobfuscator.js <input.js> <output.js>");
+  }
+  log("argv:", process.argv.slice(2).join(" "));
+  deobfuscate(readFileSync(process.argv[2], "utf8"));
+} catch (error: unknown) {
+  console.error("[deobf] FAILED:", error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}
